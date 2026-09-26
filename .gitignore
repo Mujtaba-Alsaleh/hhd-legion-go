@@ -1,0 +1,5 @@
+# package build tree (AUR PKGBUILD, hhd sources, built packages)
+build/
+
+__pycache__/
+*.pyc

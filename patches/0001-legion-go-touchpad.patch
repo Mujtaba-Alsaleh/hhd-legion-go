@@ -1,0 +1,36 @@
+Legion Go: map the touchpad on new (2025+) firmware
+
+Firmware revisions that expose the touchpad as BTN_TOUCH + BTN_0 (rather
+than BTN_TOOL_FINGER + BTN_TOOL_DOUBLETAP) were not matched by hhd's Legion
+Go tablet profile, so the touchpad was unusable (no cursor, no tap-to-click,
+no two-finger scroll).
+
+Teach the profile to accept BTN_TOUCH and map touchpad_left to BTN_0.
+
+This is the change that was previously applied by hand to the installed
+site-packages copy of hhd; keeping it as a patch means a rebuilt hhd keeps
+the fix instead of silently reverting it.
+--- a/src/hhd/device/legion_go/tablet/const.py
++++ b/src/hhd/device/legion_go/tablet/const.py
+@@ -4,8 +4,8 @@
+ 
+ LGO_TOUCHPAD_BUTTON_MAP: dict[int, Button] = to_map(
+     {
+-        "touchpad_touch": [B("BTN_TOOL_FINGER")],  # also BTN_TOUCH
+-        "touchpad_right": [B("BTN_TOOL_DOUBLETAP")],
++        "touchpad_touch": [B("BTN_TOUCH")],
++        "touchpad_left": [B("BTN_0")],
+     }
+ )
+ 
+--- a/src/hhd/device/legion_go/tablet/base.py
++++ b/src/hhd/device/legion_go/tablet/base.py
+@@ -270,7 +270,7 @@
+         vid=[0x17EF],
+         pid=[0x6182, 0x61EB],
+         name=[re.compile(".+Touchpad")],  # "  Legion Controller for Windows  Touchpad"
+-        capabilities={EC("EV_KEY"): [EC("BTN_MOUSE")]},
++        capabilities={EC("EV_KEY"): [EC("BTN_TOUCH")]},
+         btn_map=LGO_TOUCHPAD_BUTTON_MAP,
+         axis_map=LGO_TOUCHPAD_AXIS_MAP,
+         aspect_ratio=1,

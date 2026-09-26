@@ -1,0 +1,371 @@
+"""Legion Go controller battery levels as an hhd plugin.
+
+Adds a "Legion Battery" tab to hhd-ui (both the desktop app and the in-game
+overlay) showing the live battery level of the left and right Legion Go
+controllers.
+
+Why a plugin is needed: the stock `hid-lenovo-go` kernel driver does not
+surface controller battery state through evdev, so hhd has nothing to report
+for the controllers. It does pass report id 0x04 straight through to hidraw,
+and that report carries everything we need:
+
+    byte  5         left controller battery (0-100)
+    byte  7         right controller battery (0-100)
+    byte 10 bit 7   left controller radio-connected
+    byte 11 bit 7   right controller radio-connected
+    byte 12 bit 7   left controller attached  (bit = 0 -> attached)
+    byte 13 bit 7   right controller attached (bit = 0 -> attached)
+
+Report id 0x74 has the same layout; hhd documents it in
+`hhd/device/legion_go/readme.md`.
+
+Implementation notes:
+
+* hidraw hands every open reader its own copy of each report, so this plugin
+  opens a second descriptor on the same node hhd already uses. Nothing is ever
+  written to the device and hhd's own descriptor is untouched.
+* The rail is a firehose (several reports per millisecond) while hhd's update
+  loop runs roughly every 2s, so `update()` never blocks: the node is opened
+  non-blocking and whatever reports are pending are drained per call.
+* Readings are published as `display` settings, which hhd-ui renders read-only
+  and keeps up to date by polling. A rail that goes quiet freezes the last
+  reading and reports its age instead of blanking, and a controller that is
+  powered off simply reads 0%, which is what the dock reports for it.
+* No dependencies beyond hhd itself, and no extra udev rule: hhd runs as root
+  and can open the node on its own.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import select
+import time
+from typing import Any, Sequence
+
+from hhd.plugins import Config, Context, Emitter, HHDSettings, HHDPlugin
+
+logger = logging.getLogger("legion-battery")
+
+# Geometry of the dock's raw (config) interface; see the module docstring.
+REPORT_BYTES = 64
+ACCEPTED_IDS = (0x04, 0x74)
+LEGION_VID_PREFIX = "0003:17EF:"  # Lenovo
+LEGION_RAW_PHYS_SUFFIX = "/input2"  # the config interface is the one with 0x04
+
+# A rail that stops talking (dock yanked, controller hard-off mid-report) must
+# not be mistaken for a live reading, so freshness is reported separately.
+SILENCE_TIMEOUT = 15.0
+REOPEN_INTERVAL = 3.0
+READ_CHUNK = REPORT_BYTES * 32
+# Reports on this interface are 64 bytes, so a foreign one usually still frames
+# fine; a run of them means a shorter report threw the stride off, and the
+# stream is re-aligned on the next plausible header.
+MAX_FOREIGN_FRAMES = 8
+
+_UNKNOWN = "—"
+_DOCK_NAME = "legion controller"
+# hhd addresses a setting as "<plugin>.<section>.<row>" and the UI reads that
+# exact path out of the polled state, so the live values have to be written
+# there (not at "<plugin>.<row>").
+SECTION = "settings"
+
+
+def _read_dmi(field: str) -> str:
+    try:
+        with open(f"/sys/class/dmi/id/{field}") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+_is_legion_go: bool | None = None
+
+
+def on_legion_go() -> bool:
+    """Whether this machine is a Legion Go, so the tab is only offered there."""
+    global _is_legion_go
+    if _is_legion_go is None:
+        version = _read_dmi("product_version").lower()
+        vendor = _read_dmi("sys_vendor").lower()
+        name = _read_dmi("product_name").upper()
+        # "83E1"/"83E0" are the Legion Go model codes; product_version reads
+        # "Legion Go 8APU1" on this generation.
+        _is_legion_go = "legion" in version or (vendor == "lenovo" and name.startswith("83E"))
+    return _is_legion_go
+
+
+def discover_rail() -> str | None:
+    """Return /dev/hidrawN of the dock's raw interface, or None if absent."""
+    try:
+        nodes = os.listdir("/sys/class/hidraw")
+    except OSError:
+        return None
+
+    for node in nodes:
+        dev = os.path.realpath(os.path.join("/sys/class/hidraw", node, "device"))
+        hid = os.path.basename(dev)
+        if not hid.startswith(LEGION_VID_PREFIX):
+            continue
+        try:
+            with open(f"/sys/bus/hid/devices/{hid}/uevent") as f:
+                uevent = dict(
+                    line.split("=", 1) for line in f.read().splitlines() if "=" in line
+                )
+        except OSError:
+            continue
+        name = uevent.get("HID_NAME", "").lower()
+        phys = uevent.get("HID_PHYS", "")
+        if "legion" in name and phys.endswith(LEGION_RAW_PHYS_SUFFIX):
+            return os.path.join("/dev", node)
+    return None
+
+
+def parse_report(buf: bytes) -> dict[str, int] | None:
+    """Battery/attachment state from one raw report, or None if not ours."""
+    if len(buf) < REPORT_BYTES or buf[0] not in ACCEPTED_IDS:
+        return None
+    return {
+        "left": min(100, buf[5]),
+        "right": min(100, buf[7]),
+        "connL": (buf[10] >> 7) & 1,
+        "connR": (buf[11] >> 7) & 1,
+        # Attachment flag is inverted: bit 0 means attached.
+        "attL": 1 - ((buf[12] >> 7) & 1),
+        "attR": 1 - ((buf[13] >> 7) & 1),
+    }
+
+
+class _Rail:
+    """Non-blocking reader for the dock's raw interface."""
+
+    def __init__(self) -> None:
+        self.path: str | None = None
+        self.fd: int | None = None
+        self.values: dict[str, int] | None = None
+        self.last_seen: float = 0.0
+        self._buf = bytearray()
+        self._foreign = 0
+        self._retry_at = 0.0
+
+    def poll(self, now: float | None = None) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        if self.fd is None and now >= self._retry_at:
+            self._retry_at = now + REOPEN_INTERVAL
+            self._open()
+        if self.fd is not None:
+            self._drain(now)
+        return {
+            "values": self.values,
+            "last_seen": self.last_seen,
+            "seen": self.last_seen > 0.0,
+            "open": self.fd is not None,
+            "path": self.path,
+        }
+
+    def _open(self) -> None:
+        if self.path is None:
+            self.path = discover_rail()
+        if self.path is None:
+            return
+        try:
+            self.fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as e:
+            logger.debug("legion-battery: cannot open %s: %s", self.path, e)
+            self.fd = None
+            return
+        self._buf.clear()
+        self._foreign = 0
+        logger.info("legion-battery: reading controller battery from %s", self.path)
+
+    def _close_fd(self) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+        self.fd = None
+        self._buf.clear()
+
+    def close(self) -> None:
+        self._close_fd()
+
+    def _drain(self, now: float) -> None:
+        assert self.fd is not None
+        while True:
+            try:
+                ready, _, _ = select.select([self.fd], [], [], 0)
+            except (OSError, ValueError):
+                self._close_fd()
+                return
+            if not ready:
+                return
+            try:
+                chunk = os.read(self.fd, READ_CHUNK)
+            except BlockingIOError:
+                return
+            except OSError as e:
+                # The interface is torn down when the dock is yanked or powered
+                # off hard; the next poll re-discovers whatever replaced it.
+                logger.debug("legion-battery: read failed on %s: %s", self.path, e)
+                self._close_fd()
+                return
+            if not chunk:
+                self._close_fd()
+                return
+            self._buf += chunk
+            self._frame(now)
+
+    def _skip_to_header(self) -> int:
+        """How many buffered bytes to drop to reach the next battery report."""
+        for offset in range(0, len(self._buf) - REPORT_BYTES + 1):
+            if self._buf[offset] not in ACCEPTED_IDS:
+                continue
+            # A window that merely happens to start with a report id is usually
+            # not a report; both battery bytes of a real one are 0-100.
+            if self._buf[offset + 5] <= 100 and self._buf[offset + 7] <= 100:
+                return offset
+        return len(self._buf) - REPORT_BYTES + 1
+
+    def _frame(self, now: float) -> None:
+        """Consume every complete report in the buffer, keeping the newest.
+
+        Draining the whole buffer matters after a backlog builds up (right
+        after opening the node, or after the poll was late): only the last
+        report is interesting, and anything left behind would be replayed one
+        report per update, trailing reality by minutes.
+        """
+        while len(self._buf) >= REPORT_BYTES:
+            if self._buf[0] not in ACCEPTED_IDS:
+                self._foreign += 1
+                if self._foreign >= MAX_FOREIGN_FRAMES:
+                    # Re-align on the next plausible header, so real reports
+                    # queued behind the foreign ones are not thrown away.
+                    del self._buf[: self._skip_to_header()]
+                    self._foreign = 0
+                else:
+                    del self._buf[:REPORT_BYTES]
+                continue
+
+            frame = bytes(self._buf[:REPORT_BYTES])
+            del self._buf[:REPORT_BYTES]
+            self._foreign = 0
+            values = parse_report(frame)
+            if values is not None:
+                self.values = values
+                self.last_seen = now
+
+
+def _describe(pct: int | None, attached: int, connected: int) -> str:
+    if pct is None:
+        return "no data"
+    state = ["attached" if attached else "detached"]
+    if connected:
+        state.append("radio-linked")
+    if pct == 0:
+        state.append("powered off")
+    return " · ".join(state)
+
+
+def _freshness(snap: dict[str, Any], now: float) -> str:
+    if snap["path"] is None:
+        return f"no {_DOCK_NAME} dock found"
+    if not snap["open"]:
+        return "dock found, waiting for access"
+    if not snap["seen"]:
+        return f"listening on {snap['path']}"
+    age = max(0, int(now - snap["last_seen"]))
+    if age > SILENCE_TIMEOUT:
+        return f"rail silent · last update {age}s ago"
+    return f"live · updated {age}s ago"
+
+
+def rows(snap: dict[str, Any], now: float | None = None) -> dict[str, str]:
+    """The display rows, as `{key: text}` for the settings below."""
+    now = time.time() if now is None else now
+    values = snap["values"] or {}
+    left = values.get("left")
+    right = values.get("right")
+    return {
+        "left": _UNKNOWN if left is None else f"{left}%",
+        "right": _UNKNOWN if right is None else f"{right}%",
+        "left_state": _describe(left, values.get("attL", 0), values.get("connL", 0)),
+        "right_state": _describe(right, values.get("attR", 0), values.get("connR", 0)),
+        "stream": _freshness(snap, now),
+    }
+
+
+class LegionBattery(HHDPlugin):
+    name = "legion_battery"
+    log = "legion-battery"
+    priority = 10
+    location = "misc"
+
+    def __init__(self) -> None:
+        self.rail = _Rail()
+
+    def settings(self) -> HHDSettings:
+        if not on_legion_go():
+            return {}
+        return {
+            "legion_battery": {
+                SECTION: {
+                    "type": "container",
+                    "title": "Legion Controller Battery",
+                    "children": {
+                        "left": {
+                            "type": "display",
+                            "tags": ["bold"],
+                            "title": "Left",
+                            "default": _UNKNOWN,
+                        },
+                        "right": {
+                            "type": "display",
+                            "tags": ["bold"],
+                            "title": "Right",
+                            "default": _UNKNOWN,
+                        },
+                        "left_state": {
+                            "type": "display",
+                            "title": "Left state",
+                            "default": "no data",
+                        },
+                        "right_state": {
+                            "type": "display",
+                            "title": "Right state",
+                            "default": "no data",
+                        },
+                        "stream": {
+                            "type": "display",
+                            "tags": ["slim"],
+                            "title": "Stream",
+                            "default": "starting",
+                        },
+                    },
+                }
+            }
+        }
+
+    def open(self, emit: Emitter, context: Context) -> None:
+        # Opens the node if it is there; the poll itself is non-blocking.
+        self.rail.poll()
+
+    def prepare(self, conf: Config) -> None:
+        pass
+
+    def update(self, conf: Config) -> None:
+        now = time.time()
+        snap = self.rail.poll(now)
+        for key, value in rows(snap, now).items():
+            path = f"{self.name}.{SECTION}.{key}"
+            if conf.get(path, None) != value:
+                conf[path] = value
+
+    def close(self) -> None:
+        self.rail.close()
+
+
+def autodetect(existing: Sequence[HHDPlugin]) -> Sequence[HHDPlugin]:
+    if any(getattr(p, "name", None) == LegionBattery.name for p in existing):
+        return []
+    return [LegionBattery()]
