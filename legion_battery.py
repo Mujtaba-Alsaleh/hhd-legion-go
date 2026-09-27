@@ -66,7 +66,11 @@ logger = logging.getLogger("legion-battery")
 
 # Geometry of the dock's raw (config) interface; see the module docstring.
 REPORT_BYTES = 64
-ACCEPTED_IDS = (0x04, 0x74)
+# Only the status report's own id is accepted. 0x74 turned up in an older draft
+# of this file, but it never appears on the wire (110s of traffic plus a
+# re-dock cycle) and hhd's own map for this dock keys buttons and axes on it,
+# so treating it as a reading would mean publishing button traffic as a level.
+ACCEPTED_IDS = (0x04,)
 LEGION_VID_PREFIX = "0003:17EF:"  # Lenovo
 # The dock exposes three interfaces; the config (raw) one is the only one whose
 # report descriptor declares the vendor page 0xFFA0 (the gamepad and pointer

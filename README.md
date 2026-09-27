@@ -10,16 +10,19 @@ interface - and publishes it as a **Legion Battery** tab, so the levels show
 up in hhd-ui on the desktop *and* in the in-game overlay:
 
 ```
-Left          87%
-Right         92%
-Left state    attached · radio-linked
-Right state   attached · radio-linked
+Left          100%
+Right         99%
+Left state    attached
+Right state   detached
 Stream        live · updated 1s ago
 ```
 
 The tab is always there. When a controller powers off or the rail goes quiet
 it keeps the last reading and says how old it is, instead of blanking or
-vanishing the way a Quick Settings row can.
+vanishing the way a Quick Settings row can. A controller that is *out of its
+dock* still reports its real level — the example above is a controller left
+switched on and sitting on the desk — so it is marked `detached` rather than
+hidden.
 
 ## Requirements
 
