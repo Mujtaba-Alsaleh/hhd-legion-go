@@ -121,10 +121,15 @@ hidraw. Of each report:
 This layout was measured on this unit, not read from documentation, and the
 tests use frames captured off the rail as fixtures. Undocking the right
 controller was observed to move byte 13 from `0x02` to `0x01` while byte 12
-stayed at `0x02`, with the battery byte going to 0 - so an undocked controller
-and one that is merely powered off are told apart by that bit, not by the
-level. Bytes 10 and 11 read `0x01` in every captured report and are not
-interpreted.
+stayed at `0x02` - so an undocked controller and one that is merely powered
+off are told apart by that bit. Bytes 10 and 11 read `0x01` in every captured
+report and are not interpreted.
+
+A docked controller is not the only one the dock reports on: one left switched
+on and sitting on the desk kept reporting its real level (`99%`, well after it
+was undocked), because it stays in radio contact with the tablet. The tab
+therefore shows a level for a detached controller and marks it detached, rather
+than hiding it. Only the frames during the re-dock transition are unreliable.
 
 The same endpoint also carries other 64-byte messages with the same report id,
 which are button/axis traffic rather than status. They are dropped by a check
@@ -152,8 +157,9 @@ on the attachment bytes, because a transition burst once carried `1%` and
   inert on other hardware.
 
 Battery levels are what the dock reports at that moment, which includes while
-a controller is undocked but in radio range. A powered-off controller reads
-0%.
+a controller is undocked but in radio range. A controller that is powered off
+reads 0%, and that reading stays on screen rather than blanking, with the
+stream row saying how long ago it was taken.
 
 ## Development
 

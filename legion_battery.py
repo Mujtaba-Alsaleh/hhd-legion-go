@@ -14,10 +14,16 @@ hidraw, and the status report carries everything we need:
     byte 12 bit 0   left controller docked   (bit = 0 -> docked)
     byte 13 bit 0   right controller docked  (bit = 0 -> docked)
 
-That is measured, not documented: undocking the right controller was observed
-to move byte 13 from 0x02 to 0x01 while byte 12 stayed at 0x02, and to set the
-battery byte to 0. Bytes 10 and 11 read 0x01 in every captured status report
-and are deliberately not interpreted.
+That is measured, not documented: undocking the right controller was observed to
+move byte 13 from 0x02 to 0x01 while byte 12 stayed at 0x02. The flag is the low
+bit, not bit 7, which answers "docked" in every real frame. Bytes 10 and 11
+read 0x01 in every captured report and are deliberately not interpreted.
+
+A docked controller is not the only one the dock reports on: one left switched
+on on the desk kept reporting its real level (99%, well after it was
+undocked), since it stays in radio contact with the tablet. So the tab shows a
+level for a detached controller and marks it detached, rather than hiding it -
+the only frames that lie are the ones during the re-dock transition.
 
 The same endpoint also carries other 64-byte messages with the same report id
 (0x04) - button and axis traffic, distinguishable only by a different constant
