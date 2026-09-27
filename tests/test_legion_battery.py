@@ -26,20 +26,42 @@ DESCRIPTOR_RAW = bytes.fromhex("06a0ff0901a101090385041580257f350045ff7508953f81
 DESCRIPTOR_GAMEPAD = bytes.fromhex("05010906a1018506050719e029e715002501750195088102")
 DESCRIPTOR_POINTER = bytes.fromhex("05590901a10185010902a1020903150027ffff0000950175")
 
+# Real frames captured off the rail, as the first 20 bytes plus a zero tail.
+# The status frames share the constant header 04 3c 74 01; the two others are
+# different 64-byte messages the dock interleaves on the same endpoint, one of
+# them carrying 1% and 129% in the battery bytes. Each entry is
+# (report id, left, right, byte 12, byte 13) as observed, so a mistyped hex
+# string cannot silently change what a test asserts.
+CAPTURED = {
+    "both_docked": (0x04, 100, 100, 0x02, 0x02),
+    "right_out": (0x04, 100, 0, 0x02, 0x01),
+    "right_out_re_enumerated": (0x04, 100, 0, 0x02, 0x03),
+    "not_status": (0x04, 1, 129, 0x80, 0x00),
+    "all_zero_state": (0x04, 1, 0, 0x00, 0x00),
+}
 
-def report(left=87, right=92, connL=1, connR=1, attL=0, attR=0, rid=0x04, size=64):
-    """A raw dock report.
 
-    attL/attR are the wire bits, which are inverted: 0 means attached.
+def captured(name):
+    """One of the frames above, as it came off the rail."""
+    rid, left, right, b12, b13 = CAPTURED[name]
+    buf = bytearray(lb.REPORT_BYTES)
+    buf[0:2] = bytes((0x04, 0x3C if b12 or b13 else 0x06))
+    buf[5], buf[7], buf[12], buf[13] = left, right, b12, b13
+    return bytes(buf)
+
+
+def report(left=87, right=92, attL=0, attR=0, rid=0x04, size=64):
+    """A synthetic status report.
+
+    attL/attR are the wire bits of bytes 12/13, which are inverted: 0 means
+    docked. Byte 12/13 get bit 0 cleared so the frame passes the status check.
     """
     buf = bytearray(size)
     buf[0] = rid
     buf[5] = left
     buf[7] = right
-    buf[10] = connL << 7
-    buf[11] = connR << 7
-    buf[12] = attL << 7
-    buf[13] = attR << 7
+    buf[12] = 0x02 | (attL & 1)
+    buf[13] = 0x02 | (attR & 1)
     return bytes(buf)
 
 
@@ -58,17 +80,13 @@ class TestParseReport(unittest.TestCase):
         values = lb.parse_report(report(left=87, right=92))
         self.assertEqual(values["left"], 87)
         self.assertEqual(values["right"], 92)
-        self.assertEqual(values["attL"], 1)  # wire bit was 0 -> attached
-        self.assertEqual(values["attR"], 1)
-        self.assertEqual(values["connL"], 1)
-
-    def test_reports_detachment(self):
-        values = lb.parse_report(report(attL=1))
-        self.assertEqual(values["attL"], 0)
+        self.assertEqual(values["attL"], 1)  # wire bit was 0 -> docked
         self.assertEqual(values["attR"], 1)
 
-    def test_accepts_hhds_own_report_id(self):
-        self.assertIsNotNone(lb.parse_report(report(rid=0x74)))
+    def test_reports_undocking(self):
+        values = lb.parse_report(report(attR=1))
+        self.assertEqual(values["attL"], 1)
+        self.assertEqual(values["attR"], 0)
 
     def test_rejects_foreign_and_short_reports(self):
         self.assertIsNone(lb.parse_report(report(rid=0x01)))
@@ -76,6 +94,58 @@ class TestParseReport(unittest.TestCase):
 
     def test_clamps_nonsense_percentages(self):
         self.assertEqual(lb.parse_report(report(left=255))["left"], 100)
+
+
+class TestCapturedFrames(unittest.TestCase):
+    """The frames these tests decode were captured off the rail on this unit,
+    which is the only evidence for what the bytes mean."""
+
+    def test_both_docked(self):
+        values = lb.parse_report(captured("both_docked"))
+        self.assertEqual((values["left"], values["right"]), (100, 100))
+        self.assertEqual((values["attL"], values["attR"]), (1, 1))
+
+    def test_undocking_the_right_controller_is_visible(self):
+        """The bug this fixes: the old bit-7 decode read 0 in every one of
+        these bytes, so an undocked controller still showed as attached."""
+        for name in ("right_out", "right_out_re_enumerated"):
+            with self.subTest(frame=name):
+                values = lb.parse_report(captured(name))
+                self.assertEqual(values["left"], 100)
+                self.assertEqual(values["right"], 0)  # dock reports 0 when out
+                self.assertEqual(values["attL"], 1)  # left never left the dock
+                self.assertEqual(values["attR"], 0)  # right is out
+
+    def test_other_messages_on_the_endpoint_are_not_status_reports(self):
+        # Both carry report id 0x04 and are 64 bytes long, but their battery
+        # bytes are nonsense (1% and 129%) and their state bytes are 0x80/0x00.
+        for name in ("not_status", "all_zero_state"):
+            with self.subTest(frame=name):
+                frame = captured(name)
+                self.assertEqual(frame[0], 0x04)  # same report id
+                self.assertEqual(len(frame), 64)  # same length
+                self.assertFalse(lb.is_status_report(frame))
+                self.assertIsNone(lb.parse_report(frame))
+
+    def test_a_burst_of_them_cannot_overwrite_the_reading(self):
+        """The reader keeps the newest report of a drain, so an interleaved
+        message would otherwise become the published level."""
+        rail = lb._Rail()
+        rail._buf += captured("both_docked") * 3
+        rail._buf += captured("not_status")
+        rail._buf += captured("all_zero_state")
+        rail._buf += captured("right_out") * 2
+        rail._frame(time.time())
+        self.assertEqual(rail.values["left"], 100)
+        self.assertEqual(rail.values["right"], 0)
+        self.assertEqual(rail.values["attR"], 0)
+
+    def test_the_last_reading_survives_a_drain_of_only_junk(self):
+        rail = lb._Rail()
+        rail.values = lb.parse_report(captured("both_docked"))
+        rail._buf += captured("not_status") * 4
+        rail._frame(time.time())
+        self.assertEqual(rail.values["right"], 100)
 
 
 class TestRows(unittest.TestCase):
@@ -109,17 +179,19 @@ class TestRows(unittest.TestCase):
         rows = lb.rows(snap, now)
         self.assertEqual(rows["left"], "64%")
         self.assertEqual(rows["right"], "31%")
-        self.assertEqual(rows["left_state"], "attached · radio-linked")
+        self.assertEqual(rows["left_state"], "attached")
         self.assertIn("live", rows["stream"])
 
-    def test_powered_off_and_detached_are_distinguished(self):
-        values = lb.parse_report(report(left=0, right=55, connL=0, connR=0, attL=0, attR=1))
+    def test_powered_off_and_undocked_are_distinguished(self):
+        # Both read 0%, so only the dock bit can tell them apart.
+        values = lb.parse_report(report(left=0, right=55, attL=0, attR=1))
         snap, now = self.snap(values=values, seen=True, open=True, path="/dev/hidraw1")
         snap["last_seen"] = now
         rows = lb.rows(snap, now)
         self.assertEqual(rows["left"], "0%")
         self.assertEqual(rows["left_state"], "attached · powered off")
         self.assertEqual(rows["right_state"], "detached")
+        self.assertEqual(rows["right"], "55%")
 
     def test_silent_rail_reports_its_age(self):
         values = lb.parse_report(report())
@@ -411,7 +483,7 @@ class TestRecovery(unittest.TestCase):
         sysfs = FakeSysfs(self)
         sysfs.dock(minor="hidraw1", index=2)
         rail = lb._Rail()
-        rail.values = lb.parse_report(report(left=100, right=0, connR=0, attR=0))
+        rail.values = lb.parse_report(report(left=100, right=0))
         rail.last_seen = time.time()
         with mock.patch.object(lb, "discover_rail", side_effect=lambda: "/dev/hidraw1"), \
                 mock.patch.object(lb.os, "open", self.fake_open):

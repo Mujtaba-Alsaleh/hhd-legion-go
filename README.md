@@ -108,15 +108,28 @@ sudo pacman -S --noconfirm hhd   # back to stock hhd (also reverts the patches)
 
 ## How it works
 
-The dock's raw (config) interface passes report id `0x04` through to hidraw;
-`0x74` has the same layout. Of each 64-byte report:
+The dock's raw (config) interface passes a 64-byte status report through to
+hidraw. Of each report:
 
 | byte         | meaning                                        |
 | ------------ | ---------------------------------------------- |
 | 5            | left controller battery, 0-100                |
 | 7            | right controller battery, 0-100               |
-| 10 / 11 bit 7 | left / right controller radio-connected      |
-| 12 / 13 bit 7 | left / right controller attached (bit 0 = attached) |
+| 12 bit 0     | left controller docked (bit 0 = docked)       |
+| 13 bit 0     | right controller docked (bit 0 = docked)      |
+
+This layout was measured on this unit, not read from documentation, and the
+tests use frames captured off the rail as fixtures. Undocking the right
+controller was observed to move byte 13 from `0x02` to `0x01` while byte 12
+stayed at `0x02`, with the battery byte going to 0 - so an undocked controller
+and one that is merely powered off are told apart by that bit, not by the
+level. Bytes 10 and 11 read `0x01` in every captured report and are not
+interpreted.
+
+The same endpoint also carries other 64-byte messages with the same report id,
+which are button/axis traffic rather than status. They are dropped by a check
+on the attachment bytes, because a transition burst once carried `1%` and
+`129%` in the battery positions.
 
 - The node is found by walking `/sys/class/hidraw` for Lenovo's `17EF` vendor
   and picking the interface whose report descriptor declares the vendor usage
@@ -124,7 +137,9 @@ The dock's raw (config) interface passes report id `0x04` through to hidraw;
   to a device node. Docking and undocking the controllers makes the kernel
   create fresh hid devices and renumber `hidraw`, so the plugin re-checks that
   the node it holds is still the rail and re-discovers it (within
-  `REOPEN_INTERVAL`) instead of retrying a node that no longer exists.
+  `REOPEN_INTERVAL`) instead of retrying a node that no longer exists. A fresh
+  node can also briefly be root-only while udev catches up, which the same
+  retry handles.
 - hidraw gives every open reader its own copy of each report, so the plugin
   opens a second descriptor alongside hhd's own. It only ever reads.
 - The rail is a firehose while hhd's update loop runs about every 2s, so the

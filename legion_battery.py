@@ -6,18 +6,24 @@ controllers.
 
 Why a plugin is needed: the stock `hid-lenovo-go` kernel driver does not
 surface controller battery state through evdev, so hhd has nothing to report
-for the controllers. It does pass report id 0x04 straight through to hidraw,
-and that report carries everything we need:
+for the controllers. It does pass the dock's reports straight through to
+hidraw, and the status report carries everything we need:
 
     byte  5         left controller battery (0-100)
     byte  7         right controller battery (0-100)
-    byte 10 bit 7   left controller radio-connected
-    byte 11 bit 7   right controller radio-connected
-    byte 12 bit 7   left controller attached  (bit = 0 -> attached)
-    byte 13 bit 7   right controller attached (bit = 0 -> attached)
+    byte 12 bit 0   left controller docked   (bit = 0 -> docked)
+    byte 13 bit 0   right controller docked  (bit = 0 -> docked)
 
-Report id 0x74 has the same layout; hhd documents it in
-`hhd/device/legion_go/readme.md`.
+That is measured, not documented: undocking the right controller was observed
+to move byte 13 from 0x02 to 0x01 while byte 12 stayed at 0x02, and to set the
+battery byte to 0. Bytes 10 and 11 read 0x01 in every captured status report
+and are deliberately not interpreted.
+
+The same endpoint also carries other 64-byte messages with the same report id
+(0x04) - button and axis traffic, distinguishable only by a different constant
+header in bytes 1-3 and by their attachment bytes being 0x00 or 0x80. They are
+filtered out by `is_status_report`; a transition burst once showed 1% and 129%
+where no controller had reported that.
 
 Implementation notes:
 
@@ -201,18 +207,37 @@ def rail_still_present(path: str | None) -> bool:
     return info is not None and _is_raw_interface(*info)
 
 
-def parse_report(buf: bytes) -> dict[str, int] | None:
-    """Battery/attachment state from one raw report, or None if not ours."""
+def is_status_report(buf: bytes) -> bool:
+    """Whether a 64-byte frame is a status report and not another message.
+
+    The dock puts more than one kind of 64-byte message on this endpoint, all
+    of them with report id 0x04, so the id cannot tell them apart. Measured on
+    this unit, a status report's attachment bytes (12 and 13) are a small
+    value whose low bit is the present flag; the other messages use 0x00
+    (nothing) or 0x80 (top bit set) there, and their bytes 5 and 7 are not a
+    battery level at all - 1% and 129% were observed. Since the reader keeps
+    the newest report of a drain, accepting one of those would publish a level
+    no controller ever reported, so they are dropped instead.
+    """
     if len(buf) < REPORT_BYTES or buf[0] not in ACCEPTED_IDS:
+        return False
+    return all(0 < byte < 0x80 for byte in (buf[12], buf[13]))
+
+
+def parse_report(buf: bytes) -> dict[str, int] | None:
+    """Battery/attachment state from one status report, or None if not ours.
+
+    Bytes 10 and 11 are not interpreted: they read 0x01 in every status report
+    captured on this unit, so nothing here claims to know what they mean.
+    """
+    if not is_status_report(buf):
         return None
     return {
         "left": min(100, buf[5]),
         "right": min(100, buf[7]),
-        "connL": (buf[10] >> 7) & 1,
-        "connR": (buf[11] >> 7) & 1,
-        # Attachment flag is inverted: bit 0 means attached.
-        "attL": 1 - ((buf[12] >> 7) & 1),
-        "attR": 1 - ((buf[13] >> 7) & 1),
+        # Attachment flag is inverted: bit 0 clear means docked.
+        "attL": 1 - (buf[12] & 1),
+        "attR": 1 - (buf[13] & 1),
     }
 
 
@@ -228,6 +253,7 @@ class _Rail:
         self._foreign = 0
         self._retry_at = 0.0
         self._logged_path: str | None = None
+        self._rejected_logged = False
 
     def poll(self, now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
@@ -267,6 +293,7 @@ class _Rail:
             return
         self._buf.clear()
         self._foreign = 0
+        self._rejected_logged = False
         if self._logged_path != self.path:
             if self._logged_path is not None:
                 logger.info(
@@ -354,17 +381,25 @@ class _Rail:
             if values is not None:
                 self.values = values
                 self.last_seen = now
+            elif not self._rejected_logged:
+                # The dock interleaves other 64-byte messages here; log one so a
+                # future firmware that shifts the layout leaves a trace.
+                self._rejected_logged = True
+                logger.debug(
+                    "legion-battery: ignoring a non-status frame on %s: %s",
+                    self.path,
+                    frame[:20].hex(" "),
+                )
 
 
-def _describe(pct: int | None, attached: int, connected: int) -> str:
+def _describe(pct: int | None, attached: int) -> str:
     if pct is None:
         return "no data"
-    state = ["attached" if attached else "detached"]
-    if connected:
-        state.append("radio-linked")
-    if pct == 0:
-        state.append("powered off")
-    return " · ".join(state)
+    if not attached:
+        # Undocking sets this bit, and the battery byte goes to 0 as well, so
+        # the level alone cannot tell "off" from "not in the dock".
+        return "detached"
+    return "attached · powered off" if pct == 0 else "attached"
 
 
 def _freshness(snap: dict[str, Any], now: float) -> str:
@@ -389,8 +424,8 @@ def rows(snap: dict[str, Any], now: float | None = None) -> dict[str, str]:
     return {
         "left": _UNKNOWN if left is None else f"{left}%",
         "right": _UNKNOWN if right is None else f"{right}%",
-        "left_state": _describe(left, values.get("attL", 0), values.get("connL", 0)),
-        "right_state": _describe(right, values.get("attR", 0), values.get("connR", 0)),
+        "left_state": _describe(left, values.get("attL", 0)),
+        "right_state": _describe(right, values.get("attR", 0)),
         "stream": _freshness(snap, now),
     }
 
