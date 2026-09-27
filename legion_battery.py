@@ -24,6 +24,11 @@ Implementation notes:
 * hidraw hands every open reader its own copy of each report, so this plugin
   opens a second descriptor on the same node hhd already uses. Nothing is ever
   written to the device and hhd's own descriptor is untouched.
+* Re-docking the controllers makes the kernel create fresh hid devices, so the
+  hidraw node is neither stable nor unique over time: it is located by its
+  vendor usage page (0xFFA0) and re-checked every poll, and any failure to open
+  or read it drops the cached path so the next attempt looks again. Without
+  that, one re-dock is enough to freeze the tab on a stale reading forever.
 * The rail is a firehose (several reports per millisecond) while hhd's update
   loop runs roughly every 2s, so `update()` never blocks: the node is opened
   non-blocking and whatever reports are pending are drained per call.
@@ -51,7 +56,16 @@ logger = logging.getLogger("legion-battery")
 REPORT_BYTES = 64
 ACCEPTED_IDS = (0x04, 0x74)
 LEGION_VID_PREFIX = "0003:17EF:"  # Lenovo
-LEGION_RAW_PHYS_SUFFIX = "/input2"  # the config interface is the one with 0x04
+# The dock exposes three interfaces; the config (raw) one is the only one whose
+# report descriptor declares the vendor page 0xFFA0 (the gamepad and pointer
+# interfaces use 0x0001 and 0x0059). Identifying it by usage page rather than
+# by HID_PHYS "/input2" matters because hidraw numbers are not stable across
+# a re-dock.
+LEGION_RAW_USAGE_PAGE = 0xFFA0
+LEGION_RAW_PHYS_SUFFIX = "/input2"  # fallback if the descriptor is unreadable
+
+HIDRAW_SYSFS = "/sys/class/hidraw"
+HID_SYSFS = "/sys/bus/hid/devices"
 
 # A rail that stops talking (dock yanked, controller hard-off mid-report) must
 # not be mistaken for a live reading, so freshness is reported separately.
@@ -95,30 +109,96 @@ def on_legion_go() -> bool:
     return _is_legion_go
 
 
+def _first_usage_page(descriptor: bytes) -> int | None:
+    """Usage page of the first usage in a HID report descriptor.
+
+    Short items are one prefix byte plus a 0/1/2/4 byte little-endian value,
+    with the size in the prefix's low two bits. Long items (0xFE) carry their
+    own data-size byte instead and are skipped.
+    """
+    i = 0
+    while i < len(descriptor):
+        prefix = descriptor[i]
+        i += 1
+        if prefix == 0xFE:  # long item: next byte is the data size
+            if i >= len(descriptor):
+                return None
+            i += 1 + descriptor[i]
+            continue
+        size = (0, 1, 2, 4)[prefix & 0x03]
+        value = int.from_bytes(descriptor[i : i + size], "little")
+        i += size
+        if prefix & 0xFC == 0x04:  # Global, tag 0: Usage Page
+            return value
+    return None
+
+
+def _hid_node(node: str) -> tuple[str, bytes] | None:
+    """(HID_PHYS, report descriptor) for a hidraw node of the dock, or None.
+
+    Returns None for anything that is not one of the dock's own interfaces, so
+    a missing or unreadable sysfs entry is indistinguishable from "not ours".
+    """
+    device = os.path.realpath(os.path.join(HIDRAW_SYSFS, node, "device"))
+    hid = os.path.basename(device)
+    if not hid.startswith(LEGION_VID_PREFIX):
+        return None
+    base = os.path.join(HID_SYSFS, hid)
+    try:
+        with open(f"{base}/uevent") as f:
+            uevent = dict(line.split("=", 1) for line in f.read().splitlines() if "=" in line)
+    except OSError:
+        return None
+    if "legion" not in uevent.get("HID_NAME", "").lower():
+        return None
+    try:
+        with open(f"{base}/report_descriptor", "rb") as f:
+            descriptor = f.read()
+    except OSError:
+        descriptor = b""
+    return uevent.get("HID_PHYS", ""), descriptor
+
+
+def _is_raw_interface(phys: str, descriptor: bytes) -> bool:
+    page = _first_usage_page(descriptor)
+    if page is not None:
+        return page == LEGION_RAW_USAGE_PAGE
+    return phys.endswith(LEGION_RAW_PHYS_SUFFIX)
+
+
 def discover_rail() -> str | None:
     """Return /dev/hidrawN of the dock's raw interface, or None if absent."""
     try:
-        nodes = os.listdir("/sys/class/hidraw")
+        nodes = sorted(os.listdir(HIDRAW_SYSFS))
     except OSError:
         return None
 
+    fallback = None
     for node in nodes:
-        dev = os.path.realpath(os.path.join("/sys/class/hidraw", node, "device"))
-        hid = os.path.basename(dev)
-        if not hid.startswith(LEGION_VID_PREFIX):
+        info = _hid_node(node)
+        if info is None:
             continue
-        try:
-            with open(f"/sys/bus/hid/devices/{hid}/uevent") as f:
-                uevent = dict(
-                    line.split("=", 1) for line in f.read().splitlines() if "=" in line
-                )
-        except OSError:
-            continue
-        name = uevent.get("HID_NAME", "").lower()
-        phys = uevent.get("HID_PHYS", "")
-        if "legion" in name and phys.endswith(LEGION_RAW_PHYS_SUFFIX):
+        phys, descriptor = info
+        if _first_usage_page(descriptor) == LEGION_RAW_USAGE_PAGE:
             return os.path.join("/dev", node)
-    return None
+        if fallback is None and phys.endswith(LEGION_RAW_PHYS_SUFFIX):
+            fallback = os.path.join("/dev", node)  # descriptor was unreadable
+    return fallback
+
+
+def rail_still_present(path: str | None) -> bool:
+    """Whether `path` is still the dock's raw interface.
+
+    Re-docking the controllers makes the kernel create fresh hid devices, so a
+    node that was valid a minute ago can be gone - or, since hidraw numbers
+    get recycled, point at a completely different device. Callers use this to
+    notice that the descriptor they hold is dead and to look again.
+    """
+    if not path:
+        return False
+    node = os.path.basename(path)
+    info = _hid_node(node) if node.startswith("hidraw") else None
+    return info is not None and _is_raw_interface(*info)
 
 
 def parse_report(buf: bytes) -> dict[str, int] | None:
@@ -147,9 +227,16 @@ class _Rail:
         self._buf = bytearray()
         self._foreign = 0
         self._retry_at = 0.0
+        self._logged_path: str | None = None
 
     def poll(self, now: float | None = None) -> dict[str, Any]:
         now = time.time() if now is None else now
+        if self.fd is not None and not rail_still_present(self.path):
+            # Re-docking recreates the dock's hid devices, so the descriptor
+            # held here can belong to a device that no longer exists.
+            logger.info("legion-battery: %s is no longer the dock's rail", self.path)
+            self._close_fd()
+            self.path = None
         if self.fd is None and now >= self._retry_at:
             self._retry_at = now + REOPEN_INTERVAL
             self._open()
@@ -171,12 +258,22 @@ class _Rail:
         try:
             self.fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
         except OSError as e:
+            # The node went away or was renumbered since it was found; forget it
+            # so the next attempt looks for the interface again instead of
+            # retrying a path that cannot work.
             logger.debug("legion-battery: cannot open %s: %s", self.path, e)
+            self.path = None
             self.fd = None
             return
         self._buf.clear()
         self._foreign = 0
-        logger.info("legion-battery: reading controller battery from %s", self.path)
+        if self._logged_path != self.path:
+            if self._logged_path is not None:
+                logger.info(
+                    "legion-battery: rail moved from %s to %s", self._logged_path, self.path
+                )
+            self._logged_path = self.path
+            logger.info("legion-battery: reading controller battery from %s", self.path)
 
     def _close_fd(self) -> None:
         if self.fd is not None:
@@ -205,13 +302,16 @@ class _Rail:
             except BlockingIOError:
                 return
             except OSError as e:
-                # The interface is torn down when the dock is yanked or powered
-                # off hard; the next poll re-discovers whatever replaced it.
+                # The interface is torn down when the dock is yanked or the
+                # controllers are re-docked; forget the node so the next poll
+                # discovers whatever replaced it.
                 logger.debug("legion-battery: read failed on %s: %s", self.path, e)
                 self._close_fd()
+                self.path = None
                 return
             if not chunk:
                 self._close_fd()
+                self.path = None
                 return
             self._buf += chunk
             self._frame(now)

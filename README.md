@@ -119,8 +119,12 @@ The dock's raw (config) interface passes report id `0x04` through to hidraw;
 | 12 / 13 bit 7 | left / right controller attached (bit 0 = attached) |
 
 - The node is found by walking `/sys/class/hidraw` for Lenovo's `17EF` vendor
-  and the `HID_PHYS` interface that ends in `/input2`, so nothing is
-  hard-coded to a device node.
+  and picking the interface whose report descriptor declares the vendor usage
+  page `0xFFA0` (the other two are Generic Desktop), so nothing is hard-coded
+  to a device node. Docking and undocking the controllers makes the kernel
+  create fresh hid devices and renumber `hidraw`, so the plugin re-checks that
+  the node it holds is still the rail and re-discovers it (within
+  `REOPEN_INTERVAL`) instead of retrying a node that no longer exists.
 - hidraw gives every open reader its own copy of each report, so the plugin
   opens a second descriptor alongside hhd's own. It only ever reads.
 - The rail is a firehose while hhd's update loop runs about every 2s, so the

@@ -9,13 +9,22 @@ probe.py is for.
 
 import inspect
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import legion_battery as lb  # noqa: E402
+
+# The dock's three report descriptors, verbatim as the kernel exposes them:
+# the config (raw) interface is the only vendor-page (0xFFA0) one.
+DESCRIPTOR_RAW = bytes.fromhex("06a0ff0901a101090385041580257f350045ff7508953f81")
+DESCRIPTOR_GAMEPAD = bytes.fromhex("05010906a1018506050719e029e715002501750195088102")
+DESCRIPTOR_POINTER = bytes.fromhex("05590901a10185010902a1020903150027ffff0000950175")
 
 
 def report(left=87, right=92, connL=1, connR=1, attL=0, attR=0, rid=0x04, size=64):
@@ -223,6 +232,195 @@ class TestApiCompatibility(unittest.TestCase):
                 # hhd's call: plugin.<hook>(*args); ours must accept it.
                 inspect.signature(getattr(HHDPlugin, name)).bind(plugin, *args)
                 inspect.signature(getattr(plugin, name)).bind(*args)
+
+
+class TestUsagePage(unittest.TestCase):
+    def test_reads_the_page_of_a_short_item(self):
+        # 0x06: global, Usage Page, two bytes -> 0xFFA0; 0x05 is the same item
+        # with a one-byte value.
+        self.assertEqual(lb._first_usage_page(DESCRIPTOR_RAW), 0xFFA0)
+        self.assertEqual(lb._first_usage_page(DESCRIPTOR_GAMEPAD), 0x0001)  # Generic Desktop
+        self.assertEqual(lb._first_usage_page(DESCRIPTOR_POINTER), 0x0059)
+        self.assertNotEqual(
+            lb._first_usage_page(DESCRIPTOR_GAMEPAD), lb.LEGION_RAW_USAGE_PAGE
+        )
+
+    def test_handles_one_and_four_byte_items_and_long_items(self):
+        self.assertEqual(lb._first_usage_page(bytes([0x05, 0x0A])), 0x0A)  # 1 byte
+        self.assertEqual(lb._first_usage_page(bytes([0x06, 0xA0, 0xFF, 0x00])), 0xFFA0)
+        # A long item (0xFE, own data size) before the usage page must be skipped.
+        self.assertEqual(lb._first_usage_page(bytes([0xFE, 0x02, 0xAA, 0xBB, 0x06, 0xA0, 0xFF])), 0xFFA0)
+
+    def test_empty_descriptor_has_no_page(self):
+        self.assertIsNone(lb._first_usage_page(b""))
+
+
+class FakeSysfs:
+    """A throwaway /sys with hidraw nodes, so discovery can be tested offline.
+
+    `add` takes the node name, HID id, HID_PHYS and descriptor; the HID_PHYS
+    index is deliberately allowed to differ from the node name because that is
+    exactly what a re-dock does.
+    """
+
+    def __init__(self, testcase):
+        self.root = tempfile.mkdtemp()
+        testcase.addCleanup(shutil.rmtree, self.root, True)
+        self.hidraw = os.path.join(self.root, "class", "hidraw")
+        self.hid = os.path.join(self.root, "bus", "hid", "devices")
+        os.makedirs(self.hidraw)
+        os.makedirs(self.hid)
+        testcase.addCleanup(self._restore)
+        self._real = (lb.HIDRAW_SYSFS, lb.HID_SYSFS)
+        lb.HIDRAW_SYSFS, lb.HID_SYSFS = self.hidraw, self.hid
+
+    def _restore(self):
+        lb.HIDRAW_SYSFS, lb.HID_SYSFS = self._real
+
+    def add(self, node, hid, phys, descriptor=DESCRIPTOR_RAW, name="Legion Controller"):
+        device = os.path.join(self.hid, hid)
+        os.makedirs(device, exist_ok=True)
+        with open(os.path.join(device, "uevent"), "w") as f:
+            f.write(f"HID_NAME={name}\nHID_PHYS={phys}\nHID_ID={hid}\n")
+        with open(os.path.join(device, "report_descriptor"), "wb") as f:
+            f.write(descriptor)
+        os.makedirs(os.path.join(self.hidraw, node), exist_ok=True)
+        link = os.path.join(self.hidraw, node, "device")
+        if not os.path.islink(link):
+            os.symlink(device, link)
+
+    def dock(self, minor="hidraw1", index=2):
+        """The dock's three interfaces, with the raw one at HID_PHYS /inputN."""
+        stem = "usb-0000:c2:00.3-3"
+        self.add(minor, f"0003:17EF:0005:0001.000{index}", f"{stem}/input{index}", DESCRIPTOR_RAW)
+        self.add(f"hidraw{int(minor[-1]) - 1}", f"0003:17EF:0005:0001.000{index - 1}",
+                 f"{stem}/input{index - 1}", DESCRIPTOR_GAMEPAD)
+        self.add(f"hidraw{int(minor[-1]) + 1}", f"0003:17EF:0005:0001.000{index + 1}",
+                 f"{stem}/input{index + 1}", DESCRIPTOR_POINTER)
+
+
+class TestDiscovery(unittest.TestCase):
+    def test_finds_the_raw_interface_whatever_its_number_and_index(self):
+        for minor, index in (("hidraw1", 2), ("hidraw15", 2), ("hidraw9", 7)):
+            with self.subTest(node=minor, index=index):
+                sysfs = FakeSysfs(self)
+                sysfs.dock(minor=minor, index=index)
+                self.assertEqual(lb.discover_rail(), f"/dev/{minor}")
+
+    def test_ignores_gamepad_pointer_and_other_vendors(self):
+        sysfs = FakeSysfs(self)
+        sysfs.add("hidraw0", "0003:17EF:0005:0001.0001", "usb-x/input1", DESCRIPTOR_GAMEPAD)
+        sysfs.add("hidraw3", "0003:17EF:0005:0001.0002", "usb-x/input2", DESCRIPTOR_RAW)
+        sysfs.add("hidraw4", "0003:17EF:0005:0001.0003", "usb-x/input3", DESCRIPTOR_POINTER)
+        # Another device's vendor page must not be mistaken for the dock.
+        sysfs.add("hidraw5", "0003:046D:0B00:0001.0000", "usb-y/input1", DESCRIPTOR_RAW,
+                  name="Some Other Vendor Device")
+        self.assertEqual(lb.discover_rail(), "/dev/hidraw3")
+
+    def test_falls_back_to_phys_when_no_descriptor_can_be_read(self):
+        sysfs = FakeSysfs(self)
+        sysfs.add("hidraw1", "0003:17EF:0005:0001.0001", "usb-x/input1", DESCRIPTOR_GAMEPAD)
+        sysfs.add("hidraw2", "0003:17EF:0005:0001.0002", "usb-x/input2", b"")
+        self.assertEqual(lb.discover_rail(), "/dev/hidraw2")
+
+    def test_no_dock_returns_none(self):
+        FakeSysfs(self)
+        self.assertIsNone(lb.discover_rail())
+
+    def test_presence_check_notices_a_vanished_or_reused_node(self):
+        sysfs = FakeSysfs(self)
+        sysfs.dock(minor="hidraw15", index=2)
+        self.assertTrue(lb.rail_still_present("/dev/hidraw15"))
+        # The dock is gone: the node disappeared with it.
+        shutil.rmtree(os.path.join(sysfs.hidraw, "hidraw15"))
+        self.assertFalse(lb.rail_still_present("/dev/hidraw15"))
+        # Another interface now answers to that number.
+        sysfs.add("hidraw15", "0003:17EF:0005:0001.0009", "usb-x/input9", DESCRIPTOR_GAMEPAD)
+        self.assertFalse(lb.rail_still_present("/dev/hidraw15"))
+        # A non-hidraw path, or nothing at all, is never the rail.
+        self.assertFalse(lb.rail_still_present("/dev/null"))
+        self.assertFalse(lb.rail_still_present(None))
+
+
+class TestRecovery(unittest.TestCase):
+    """Re-docking makes the kernel create new hidraw nodes, so a held
+    descriptor and the path that produced it both go stale. These are the
+    paths that used to wedge the plugin on a frozen reading forever."""
+
+    def setUp(self):
+        # `os` is a shared module, so keep the real function to delegate to.
+        self.real_open = os.open
+        # A pipe with its write end open is readable-but-empty, i.e. exactly
+        # "the rail went quiet" - unlike an empty file, which is at EOF.
+        self.read_fd, self.write_fd = os.pipe()
+        for fd in (self.read_fd, self.write_fd):
+            self.addCleanup(os.close, fd)
+
+    def fake_open(self, path, flags, *args, **kwargs):
+        """Stand in for the hidraw node only, with a quiet pipe."""
+        if str(path).startswith("/dev/hidraw"):
+            return os.dup(self.read_fd)
+        return self.real_open(path, flags, *args, **kwargs)
+
+    def test_failed_open_forgets_the_path_so_discovery_runs_again(self):
+        rail = lb._Rail()
+        rail.path = "/dev/hidraw1"  # stale: this node no longer exists
+        with mock.patch.object(lb.os, "open", side_effect=FileNotFoundError(2, "gone")):
+            rail._open()
+        self.assertIsNone(rail.path)
+        self.assertIsNone(rail.fd)
+
+    def test_read_failure_forgets_the_path(self):
+        rail = lb._Rail()
+        with mock.patch.object(lb, "discover_rail", return_value="/dev/hidraw1"), \
+                mock.patch.object(lb.os, "open", self.fake_open):
+            rail.poll()
+            self.assertEqual(rail.path, "/dev/hidraw1")
+            with mock.patch.object(lb.os, "read", side_effect=OSError(19, "no such device")):
+                rail.poll()
+        self.assertIsNone(rail.fd)
+        self.assertIsNone(rail.path)
+
+    def test_renumbered_node_is_dropped_and_rediscovered(self):
+        """The real failure: the rail came back as /dev/hidraw15 while the
+        plugin still held /dev/hidraw1, and never noticed."""
+        sysfs = FakeSysfs(self)
+        sysfs.dock(minor="hidraw1", index=2)
+        rail = lb._Rail()
+        found = ["/dev/hidraw1"]
+        with mock.patch.object(lb, "discover_rail", side_effect=lambda: found[0]), \
+                mock.patch.object(lb.os, "open", self.fake_open):
+            snap = rail.poll()
+            self.assertTrue(snap["open"])
+            self.assertEqual(snap["path"], "/dev/hidraw1")
+
+            # Re-dock: the old node disappears, a new one takes its place.
+            shutil.rmtree(os.path.join(sysfs.hidraw, "hidraw1"))
+            sysfs.dock(minor="hidraw15", index=2)
+            found[0] = "/dev/hidraw15"
+
+            # Recovery is bounded by the retry interval, not by a restart.
+            snap = rail.poll(time.time() + lb.REOPEN_INTERVAL + 1)
+        self.assertEqual(snap["path"], "/dev/hidraw15")
+        self.assertTrue(snap["open"])
+        self.assertIsNotNone(rail.fd)
+        self.assertEqual(rail._logged_path, "/dev/hidraw15")
+
+    def test_frozen_reading_survives_a_renumber(self):
+        """Losing the node must not blank the tab: the last reading stays."""
+        sysfs = FakeSysfs(self)
+        sysfs.dock(minor="hidraw1", index=2)
+        rail = lb._Rail()
+        rail.values = lb.parse_report(report(left=100, right=0, connR=0, attR=0))
+        rail.last_seen = time.time()
+        with mock.patch.object(lb, "discover_rail", side_effect=lambda: "/dev/hidraw1"), \
+                mock.patch.object(lb.os, "open", self.fake_open):
+            rail.poll()
+            shutil.rmtree(os.path.join(sysfs.hidraw, "hidraw1"))
+            snap = rail.poll()
+        self.assertEqual(snap["values"]["left"], 100)
+        self.assertEqual(snap["values"]["right"], 0)
+        self.assertTrue(snap["seen"])
 
 
 if __name__ == "__main__":
