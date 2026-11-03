@@ -1,13 +1,23 @@
-# legion-battery-hhd
+# hhd-legion-go
 
-Live Legion Go controller battery levels as a tab in
-[hhd](https://github.com/hhd-dev/hhd)/hhd-ui.
+Everything that keeps [hhd](https://github.com/hhd-dev/hhd) happy on the
+Lenovo Legion Go (Arch, mostly) — one repo, two jobs:
 
-hhd has nothing to say about the two Legion Go controllers: the stock
-`hid-lenovo-go` kernel driver never surfaces their battery state through
-evdev. This plugin reads it where it does exist - the dock's raw HID
-interface - and publishes it as a **Legion Battery** tab, so the levels show
-up in hhd-ui on the desktop *and* in the in-game overlay:
+1. **Legion Battery** — a plugin that adds a live controller-battery tab to
+   hhd / hhd-ui, on the desktop *and* in the in-game overlay.
+2. **A grab-latest-and-patch pipeline** — `./install.sh` pulls the *current*
+   hhd PKGBUILD from the AUR, folds the plugin into its source, applies
+   whatever is sitting in `patches/`, builds the package and installs it.
+
+So you always end up with the newest hhd + the battery tab + the Legion Go
+fixes, in one command. No hand-editing `site-packages` (an hhd upgrade blows
+that away anyway) — just re-run `./install.sh` and it all comes back.
+
+## The battery tab
+
+The kernel's `hid-lenovo-go` driver never exposes the two controllers'
+battery through evdev, but the dock's raw HID interface does. The plugin
+reads it there and publishes a **Legion Battery** tab:
 
 ```
 Left          100%
@@ -18,167 +28,150 @@ Stream        live · updated 1s ago
 ```
 
 The tab is always there. When a controller powers off or the rail goes quiet
-it keeps the last reading and says how old it is, instead of blanking or
-vanishing the way a Quick Settings row can. A controller that is *out of its
-dock* still reports its real level — the example above is a controller left
-switched on and sitting on the desk — so it is marked `detached` rather than
-hidden.
-
-## Requirements
-
-- hhd 4.1.12 or newer (uses the `display` setting type and hhd's plugin entry
-  points) with hhd-ui 3.4.2 or newer
-- no new dependencies: the plugin is stdlib plus hhd's own `hhd.plugins`
-- no new udev rule and no file access changes: hhd already runs as root and
-  opens the dock's hidraw node on its own
+it keeps the last reading and tells you how old it is, instead of blanking or
+vanishing. A controller that's *out of its dock* still reports its real level
+(example: the right one above is switched on and sitting on a desk) — so it's
+marked `detached` rather than hidden.
 
 ## Install
 
-### Folded into hhd (default)
-
 ```sh
+git clone https://github.com/Mujtaba-Alsaleh/hhd-legion-go.git
+cd hhd-legion-go
 ./install.sh
 ```
 
-This fetches the AUR `hhd` PKGBUILD, vendors the plugin into the hhd source
-tree (`vendor-hhd.sh`), builds the package with `makepkg` and installs it with
-`pacman -U`. The plugin then ships *inside* the hhd package, registered in
-hhd's own entry points, so there is nothing to keep in sync and an hhd upgrade
-does not silently remove it.
+That one command:
 
-Two details worth knowing:
+- fetches the latest AUR PKGBUILD for hhd (so you're not stuck on a pinned
+  version),
+- copies `legion_battery.py` into the hhd source tree (`vendor-hhd.sh`),
+- applies every `patches/*.patch` in filename order,
+- builds with `makepkg` (it may ask for sudo to install build deps),
+- refuses to install if the plugin somehow isn't in the finished package,
+- installs with `pacman -U`, restarts hhd, and runs a self-check.
 
-- Every `patches/*.patch` in this repo is applied during the build. The repo
-  ships `0001-legion-go-touchpad.patch`, which is the touchpad fix that
-  previously had to be hand-edited into
-  `/usr/lib/python3.14/site-packages/hhd` (and lost on every hhd upgrade). With
-  the patch in the build, a rebuilt hhd keeps the fix. Add further patches the
-  same way - the build applies them in filename order.
-- `makepkg` may install hhd's build dependencies (`python-build`,
-  `python-installer`, `python-babel`) with sudo.
-
-Inspect what the build will do without running it:
+Useful variations:
 
 ```sh
-./install.sh --dry-run     # fetch + inject, print the PKGBUILD diff
-./install.sh --refresh     # re-fetch the AUR PKGBUILD first
+./install.sh --dry-run     # prepare everything, show the PKGBUILD diff, build nothing
+./install.sh --refresh     # re-fetch the AUR PKGBUILD first (new hhd release?)
+./install.sh --check       # is the plugin loaded? what's the tab showing?
+./install.sh --local       # skip the package build: drop the plugin on hhd's
+                           # PYTHONPATH via a systemd drop-in instead
+./install.sh --uninstall   # undo the --local route
 ```
 
-### Without rebuilding (alternative)
+Pick one route: package (default) or `--local`, not both — with the package
+installed, the plugin is already in hhd's site-packages.
 
-```sh
-./install.sh --local
-```
+## Patches
 
-Copies the module and a small hand-written `dist-info` into
-`~/.local/share/legion-battery-hhd` and adds that directory to hhd's
-`PYTHONPATH` through a systemd drop-in. No package build, so this also works
-where hhd is not a pacman package. The drop-in *repeats* the `PYTHONPATH`
-entries your other drop-ins already set (systemd lets the last assignment win,
-so a naive drop-in would break the adjustor/TDP one).
+This repo doesn't just ship the plugin — it carries fixes for hhd itself and
+keeps them applied across rebuilds:
 
-Pick one route, not both: with the package route active the module is already
-in hhd's site-packages.
+| patch | what it fixes |
+| --- | --- |
+| `0001-legion-go-touchpad.patch` | touchpad dead on 2025+ firmware: the profile didn't match `BTN_TOUCH` + `BTN_0` |
+| `0002-overlay-nested-map-unmap-only.patch` | hhd's overlay left the game on a black screen after closing the QAM in a nested gamescope session — the window is now hidden by unmapping instead of opacity/`STEAM_*` property games |
 
-## Verify
-
-```sh
-./install.sh --check
-```
-
-prints where the plugin lives, the entry point hhd found, whether the service
-is up, and the values currently published to the tab.
-
-To watch the rail directly, without hhd:
-
-```sh
-./probe.py 30
-```
+Adding your own: drop a `.patch` into `patches/` (paths like
+`--- a/src/hhd/...`, applied with `-p1`), and it rides along on the next
+`./install.sh`. Filename order = apply order. That's the whole workflow for
+keeping a fix alive across hhd upgrades.
 
 ## After an hhd upgrade
 
-`paru -Syu` replaces the package with a stock build, so the plugin (and the
-touchpad patch) go away. Re-run `./install.sh` to get them back; `--check`
-tells you when that is needed. Values live in `/etc/hhd/state.yml` and survive
-the reinstall.
+`paru -Syu` (or any stock hhd reinstall) replaces the package and the plugin
+and patches go with it. Just run `./install.sh` again — `--check` will tell
+you when that's needed. Battery values live in `/etc/hhd/state.yml`, so they
+survive the reinstall.
 
 ## Uninstall
 
 ```sh
 ./install.sh --uninstall    # removes the --local drop-in and directory
-sudo pacman -S --noconfirm hhd   # back to stock hhd (also reverts the patches)
+sudo pacman -S --noconfirm hhd   # back to stock hhd (also drops the patches)
 ```
 
-## How it works
+## How the battery reading works
 
 The dock's raw (config) interface passes a 64-byte status report through to
 hidraw. Of each report:
 
-| byte         | meaning                                        |
-| ------------ | ---------------------------------------------- |
-| 5            | left controller battery, 0-100                |
-| 7            | right controller battery, 0-100               |
-| 12 bit 0     | left controller docked (bit 0 = docked)       |
-| 13 bit 0     | right controller docked (bit 0 = docked)      |
+| byte        | meaning                                 |
+| ----------- | --------------------------------------- |
+| 5           | left controller battery, 0-100          |
+| 7           | right controller battery, 0-100         |
+| 12 bit 0    | left controller docked                  |
+| 13 bit 0    | right controller docked                 |
 
-This layout was measured on this unit, not read from documentation, and the
-tests use frames captured off the rail as fixtures. Undocking the right
-controller was observed to move byte 13 from `0x02` to `0x01` while byte 12
-stayed at `0x02` - so an undocked controller and one that is merely powered
-off are told apart by that bit. Bytes 10 and 11 read `0x01` in every captured
-report and are not interpreted.
+This layout was measured on one unit, not read from docs, and the tests use
+frames captured off the rail as fixtures. An undocked-but-powered-on
+controller keeps reporting its real level over radio, which is why a
+`detached` controller still shows a percentage — only the re-dock transition
+frames are unreliable. Other 64-byte messages on the same endpoint are
+button/axis traffic, not status; they're dropped by a check on the attachment
+bytes (a transition burst once carried `1%` and `129%` in the battery
+positions).
 
-A docked controller is not the only one the dock reports on: one left switched
-on and sitting on the desk kept reporting its real level (`99%`, well after it
-was undocked), because it stays in radio contact with the tablet. The tab
-therefore shows a level for a detached controller and marks it detached, rather
-than hiding it. Only the frames during the re-dock transition are unreliable.
-
-The same endpoint also carries other 64-byte messages with the same report id,
-which are button/axis traffic rather than status. They are dropped by a check
-on the attachment bytes, because a transition burst once carried `1%` and
-`129%` in the battery positions.
+The details that make it robust:
 
 - The node is found by walking `/sys/class/hidraw` for Lenovo's `17EF` vendor
-  and picking the interface whose report descriptor declares the vendor usage
-  page `0xFFA0` (the other two are Generic Desktop), so nothing is hard-coded
-  to a device node. Docking and undocking the controllers makes the kernel
-  create fresh hid devices and renumber `hidraw`, so the plugin re-checks that
-  the node it holds is still the rail and re-discovers it (within
-  `REOPEN_INTERVAL`) instead of retrying a node that no longer exists. A fresh
-  node can also briefly be root-only while udev catches up, which the same
-  retry handles.
+  and picking the interface whose report descriptor declares vendor usage page
+  `0xFFA0` — nothing hard-coded to a device node. Re-docking renumbers
+  `hidraw`, so the plugin re-checks and re-discovers the node (within
+  `REOPEN_INTERVAL`) instead of hammering one that's gone, which also covers
+  the window where a fresh node is briefly root-only while udev catches up.
 - hidraw gives every open reader its own copy of each report, so the plugin
-  opens a second descriptor alongside hhd's own. It only ever reads.
-- The rail is a firehose while hhd's update loop runs about every 2s, so the
-  node is opened `O_NONBLOCK` and whatever reports are pending are drained per
-  call. `update()` never blocks.
-- Values are written into hhd's config as `display` settings, addressed as
-  `<plugin>.<section>.<row>` - the exact path hhd-ui reads out of the polled
-  state - and only when they actually change.
-- The tab is only offered on a Legion Go (checked via DMI), so the plugin is
+  opens a second descriptor alongside hhd's own — read-only.
+- The rail is a firehose while hhd updates about every 2s, so the node is
+  `O_NONBLOCK` and pending reports are drained per call. `update()` never
+  blocks.
+- Values are published as hhd `display` settings at
+  `<plugin>.<section>.<row>` — exactly where hhd-ui reads them — and only
+  when they change.
+- The tab is only offered on a Legion Go (DMI check), so the plugin stays
   inert on other hardware.
 
-Battery levels are what the dock reports at that moment, which includes while
-a controller is undocked but in radio range. A controller that is powered off
-reads 0%, and that reading stays on screen rather than blanking, with the
-stream row saying how long ago it was taken.
+A powered-off controller reads 0%, and that sticks on screen with the stream
+row saying how long ago it was taken, instead of blanking.
+
+## Requirements
+
+- Arch with pacman + `base-devel` (makepkg) for the package route — the
+  plugin itself has no dependencies beyond hhd (`python-build`,
+  `python-installer`, `python-babel` may be pulled in as build deps).
+- hhd 4.1.12+ plugin API (`display` setting type); in practice the install
+  script just builds whatever hhd is current on the AUR.
+- A Legion Go for the tab to appear; everything else (patches) is
+  device-independent.
 
 ## Development
 
 ```sh
 python3 tests/test_legion_battery.py   # 16 tests, no hardware needed
-./probe.py                             # live readings
+./probe.py                             # live readings straight from the rail
 ./vendor-hhd.sh /path/to/hhd-source    # vendor into any hhd tree (idempotent)
 ```
 
 `tests/` covers the report parser, row formatting and stream framing, and
-binds the plugin hooks against hhd's real `HHDPlugin` class so an hhd upgrade
-that changes a hook signature fails loudly instead of the plugin being dropped
-at startup. One test compares the paths the plugin writes with the ones hhd's
-own `parse_defaults()` generates for the plugin's settings.
+binds the plugin hooks against hhd's real `HHDPlugin` class — so an hhd
+upgrade that changes a hook signature fails loudly instead of silently
+dropping the plugin at startup. One test also compares the paths the plugin
+writes against what hhd's own `parse_defaults()` generates.
 
 `vendor-hhd.sh` is the whole integration: it copies the module into
-`src/hhd/plugins/` and adds one line to the `[project.entry-points."hhd.plugins"]`
-table, so any hhd packaging (a PKGBUILD `prepare()`, a distro package, a
-`pip install`) can carry the plugin with it.
+`src/hhd/plugins/` and adds one line to the entry-points table, so any hhd
+packaging (PKGBUILD `prepare()`, distro package, pip) can carry it.
+
+## Notes
+
+`hhd-latest-power-fixes.md` is the long-form debugging journal: hhd-ui
+boot coredumps, the performance→balanced profile flip chase, and the nested
+gamescope blackscreen hunt that ended in patch 0002. Worth a read if you're
+chasing similar weirdness.
+
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE).
