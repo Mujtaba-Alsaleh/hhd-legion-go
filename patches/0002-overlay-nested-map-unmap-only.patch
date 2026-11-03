@@ -1,0 +1,118 @@
+Nested (no-steam) gamescope: hide the overlay by unmapping, not opacity
+
+Opening and closing the hhd overlay inside a nested gamescope session left
+the game on a permanent black screen: the old code hid the window with
+_NET_WM_WINDOW_OPACITY=0 and tagged it STEAM_GAME/STEAM_BIGPICTURE, which
+makes gamescope key its app/scene handling off the window and desync it
+from the real game (DXVK present loop then starves and the game stops
+rendering while all X-side focus state looks healthy).
+
+Nested sessions have no WM, so the overlay window is now simply mapped on
+top while shown and unmapped while hidden:
+
+- prepare_hhd: do not tag STEAM_GAME/STEAM_BIGPICTURE or touch opacity;
+  unmap Electron's initially-mapped window right away (it used to be
+  hidden by opacity=0) and select StructureNotify so a later Electron
+  re-show wakes the overlay loop.
+- show_hhd/hide_hhd: nested branch maps/unmaps only; STEAM_INPUT_FOCUS /
+  STEAM_OVERLAY writes are done only when a Steam client exists.
+- loop_manage_overlay: re-unmap every tick while the UI is closed so
+  Electron can never leave its black window covering the game.
+
+Verified on the Legion Go nested sessions (Skyrim SE via Proton): game
+renders from boot, QAM open/close no longer blackscreens it.
+
+--- a/src/hhd/plugins/overlay/x11.py
++++ b/src/hhd/plugins/overlay/x11.py
+@@ -325,20 +325,18 @@
+ 
+ 
+ def prepare_hhd(display, hhd, steam=None):
+-    if not steam:
+-        # If hhd appears a game steam will have issues with per-game profiles
+-        hhd.change_property(
+-            display.get_atom("STEAM_GAME"), Xatom.CARDINAL, 32, [HHD_ID]
+-        )
+-        # If steam is missing, gamescope disables window controls, so we have
+-        # to play with the opacity to hide.
+-        hhd.change_property(
+-            display.get_atom("_NET_WM_WINDOW_OPACITY"), Xatom.CARDINAL, 32, [0]
+-        )
+-        hhd.change_property(display.get_atom("STEAM_BIGPICTURE"), Xatom.CARDINAL, 32, [1])
+-
++    # Nested (no steam): never tag the window with STEAM_GAME/STEAM_BIGPICTURE
++    # or touch opacity. gamescope keys its app/scene handling off those and a
++    # wrong state after the overlay closes leaves the game black. The window
++    # simply maps on top when shown and unmaps when hidden.
+     hhd.change_property(display.get_atom("STEAM_NOTIFICATION"), Xatom.CARDINAL, 32, [0])
+     hhd.change_property(display.get_atom("GAMESCOPE_NO_FOCUS"), Xatom.CARDINAL, 32, [1])
++    if not steam:
++        # Electron starts its window mapped (the old opacity=0 hid it). Unmap
++        # so the game is visible from boot; show_hhd() maps it on open.
++        # StructureNotify makes Electron's later re-show wake the loop.
++        hhd.change_attributes(event_mask=X.StructureNotifyMask)
++        hhd.unmap()
+     display.flush()
+     display.sync()
+ 
+@@ -425,9 +423,9 @@
+     prop = r.get_property(stat_click, Xatom.CARDINAL, 0, 15)
+     touch_was_set = prop and prop.value
+ 
+-    hhd.change_property(stat_focus, Xatom.CARDINAL, 32, [1])
+-    hhd.change_property(stat_overlay, Xatom.CARDINAL, 32, [1])
+     if steam:
++        hhd.change_property(stat_focus, Xatom.CARDINAL, 32, [1])
++        hhd.change_property(stat_overlay, Xatom.CARDINAL, 32, [1])
+         steam.change_property(stat_focus, Xatom.CARDINAL, 32, [0])
+         steam.change_property(stat_overlay, Xatom.CARDINAL, 32, [0])
+         steam.change_property(stat_notify, Xatom.CARDINAL, 32, [0])
+@@ -446,9 +444,8 @@
+         # hhd.change_property(stat_game, Xatom.CARDINAL, 32, [new_id])
+ 
+     if not steam:
+-        hhd.change_property(
+-            display.get_atom("_NET_WM_WINDOW_OPACITY"), Xatom.CARDINAL, 32, [0xFFFFFFFF]
+-        )
++        # Nested: just render on top. No opacity games.
++        hhd.map()
+ 
+     if touch_was_set:
+         # Give it a bit of time before setting the touch target to avoid steam
+@@ -469,8 +466,9 @@
+     stat_click = display.get_atom("STEAM_TOUCH_CLICK_MODE")
+ 
+     # Set values
+-    hhd.change_property(stat_focus, Xatom.CARDINAL, 32, [0])
+-    hhd.change_property(stat_overlay, Xatom.CARDINAL, 32, [0])
++    if steam:
++        hhd.change_property(stat_focus, Xatom.CARDINAL, 32, [0])
++        hhd.change_property(stat_overlay, Xatom.CARDINAL, 32, [0])
+ 
+     # Restore steam
+     if steam and old:
+@@ -486,9 +484,9 @@
+             )
+ 
+     if not steam:
+-        hhd.change_property(
+-            display.get_atom("_NET_WM_WINDOW_OPACITY"), Xatom.CARDINAL, 32, [0x0]
+-        )
++        # Nested: unmap only. The window renders on top while mapped; no
++        # transparency or property changes on either transition.
++        hhd.unmap()
+ 
+     display.flush()
+     display.sync()
+--- a/src/hhd/plugins/overlay/base.py
++++ b/src/hhd/plugins/overlay/base.py
+@@ -258,6 +258,9 @@
+             # make sure hhd cant be focused
+             if not steam and not shown:
+                 make_hhd_not_focusable(disp)
++                # Electron may re-show its window after startup; keep it
++                # unmapped while closed so it never covers the game.
++                hhd.unmap()
+ 
+             # Process system logs
+             while True:
